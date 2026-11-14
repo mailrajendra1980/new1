@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import type { MessageCounts, MessageCountsDelta } from "./types";
+import { hasPendingOverlay, subscribePendingOverlay } from "@/lib/messages/field-store";
+import { hasMembershipOverlay, subscribeMembership } from "@/lib/messages/membership-store";
 import { clearMessageCountsCache, fetchMessageCounts } from "./utils";
 
 const REFRESH_DEBOUNCE_MS = 150;
@@ -31,21 +33,22 @@ export function useMessageCounts(mailboxId?: string | null, enabled = true) {
 		let cancelled = false;
 		let refreshTimer: number | null = null;
 		let requestNumber = 0;
+		const hasPending = () => hasPendingOverlay() || hasMembershipOverlay();
 
 		async function loadCounts() {
 			const currentRequest = ++requestNumber;
 			setIsLoading(true);
 			try {
 				const nextCounts = await fetchMessageCounts(mailboxId);
-				if (!cancelled && currentRequest === requestNumber) setCounts(nextCounts ?? emptyCounts);
+				if (!cancelled && currentRequest === requestNumber && !hasPending()) {
+					setCounts(nextCounts ?? emptyCounts);
+				}
 			} finally {
 				if (!cancelled && currentRequest === requestNumber) setIsLoading(false);
 			}
 		}
 
-		void loadCounts();
-		function onMessagesChanged() {
-			clearMessageCountsCache();
+		function scheduleCountsLoad() {
 			if (document.visibilityState !== "visible") return;
 			if (refreshTimer) window.clearTimeout(refreshTimer);
 			refreshTimer = window.setTimeout(() => {
@@ -53,6 +56,19 @@ export function useMessageCounts(mailboxId?: string | null, enabled = true) {
 				// The cache was cleared above, so hooks refreshing for the same change share one request.
 				void loadCounts();
 			}, REFRESH_DEBOUNCE_MS);
+		}
+
+		// A pending undo has not settled on the server yet. Keep the optimistic
+		// one-shot delta on screen and fetch authoritative counts only afterwards.
+		if (hasPending()) {
+			clearMessageCountsCache();
+		} else {
+			void loadCounts();
+		}
+		function onMessagesChanged() {
+			if (hasPending()) return;
+			clearMessageCountsCache();
+			scheduleCountsLoad();
 		}
 		function onMessageCountsDelta(event: Event) {
 			const detail = (event as CustomEvent<MessageCountsDelta>).detail;
@@ -68,6 +84,21 @@ export function useMessageCounts(mailboxId?: string | null, enabled = true) {
 				},
 			}));
 		}
+		function onPendingChange() {
+			// Invalidate a load that started before the overlay changed so its
+			// server value cannot land on top of the optimistic state.
+			requestNumber += 1;
+			clearMessageCountsCache();
+			if (hasPending()) {
+				if (refreshTimer) window.clearTimeout(refreshTimer);
+				refreshTimer = null;
+				setIsLoading(false);
+				return;
+			}
+			scheduleCountsLoad();
+		}
+		const unsubscribePending = subscribePendingOverlay(onPendingChange);
+		const unsubscribeMembership = subscribeMembership(onPendingChange);
 		window.addEventListener("mailflare:messages-changed", onMessagesChanged);
 		window.addEventListener("mailflare:message-counts-changed", onMessagesChanged);
 		window.addEventListener("mailflare:message-counts-delta", onMessageCountsDelta);
@@ -77,6 +108,8 @@ export function useMessageCounts(mailboxId?: string | null, enabled = true) {
 			window.removeEventListener("mailflare:messages-changed", onMessagesChanged);
 			window.removeEventListener("mailflare:message-counts-changed", onMessagesChanged);
 			window.removeEventListener("mailflare:message-counts-delta", onMessageCountsDelta);
+			unsubscribePending();
+			unsubscribeMembership();
 			if (refreshTimer) window.clearTimeout(refreshTimer);
 		};
 	}, [enabled, mailboxId]);

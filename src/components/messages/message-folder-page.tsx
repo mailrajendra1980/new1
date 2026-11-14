@@ -21,6 +21,7 @@ import type { Message } from "@/hooks/types";
 import { setMessageDragData } from "@/lib/messages/drag-utils";
 import { BulkMessageToolbar } from "./bulk-message-toolbar";
 import { useMessageListState } from "./message-list-state";
+import { getEmptyPageOffset } from "./page-offset";
 import { SwipeableRow } from "./swipeable-row";
 import { MessageListRowActions } from "./message-list-row-actions";
 import { dispatchMessageCountsDelta, toggleMessageStar } from "./message-list-row-actions-utils";
@@ -153,7 +154,7 @@ function MessageListRowComponent({
 			setRead(true);
 			if (previousThreadUnread !== undefined) setThreadUnread(Math.max(0, previousThreadUnread - 1));
 			if (affectsInboxCount && message.direction === "inbound") dispatchMessageCountsDelta({ inboxUnreadDelta: -1 });
-			void runBulkMessageAction([message.id], "read", false).catch(() => {
+			void runBulkMessageAction([message.id], "read", false, undefined, { undo: false }).catch(() => {
 				setRead(false);
 				setThreadUnread(previousThreadUnread);
 				if (affectsInboxCount && message.direction === "inbound") dispatchMessageCountsDelta({ inboxUnreadDelta: 1 });
@@ -257,7 +258,7 @@ function MessageListRowComponent({
 						size="sm"
 						className="relative z-10"
 						onClick={() => {
-							void toggleMessageStar(message.id).then((result) => setStarred(result.starred));
+							void toggleMessageStar(message.id, !starred).then((result) => setStarred(result.starred));
 						}}
 						aria-label={t("message.star")}
 						aria-pressed={starred}
@@ -472,8 +473,10 @@ export function MessageFolderPage({
 	}, [messages, isLoading, setSelectedMessages]);
 
 	useEffect(() => {
-		if (isLoading || offset === 0 || messages.length > 0) return;
-		setOffset(total > 0 ? Math.floor((total - 1) / limit) * limit : 0);
+		if (isLoading || messages.length > 0) return;
+		const nextOffset = getEmptyPageOffset(offset, total, limit);
+		if (nextOffset === null) return;
+		setOffset(nextOffset);
 	}, [isLoading, offset, messages.length, total, limit, setOffset]);
 
 	const updateSelectedMessage = useCallback((messageId: string, selected: boolean) => {
@@ -549,7 +552,10 @@ export function MessageFolderPage({
 		}
 
 		setPendingBulkAction(true);
-		const previousMessages = messages;
+		const previousReadStates = new Map(messages
+			.filter((message) => selectedIdSet.has(message.id))
+			.map((message) => [message.id, { read: message.read, threadUnread: message.threadUnread }]));
+		const previousSelectedRead = new Map(selectedMessages.map((message) => [message.id, message.read]));
 		const readValue = action === "read" ? true : action === "unread" ? false : null;
 		const inboxUnreadDelta = readValue === null || config.folder !== "inbox" || config.folderId
 			? 0
@@ -570,7 +576,21 @@ export function MessageFolderPage({
 			setSelectedMessages([]);
 		} catch (error) {
 			if (readValue !== null) {
-				updateMessages(previousMessages);
+				// Roll back only the fields this action optimistically changed, and only
+				// on the rows it touched; another action must not be clobbered.
+				updateMessages((current) => current.map((message) => {
+					const previous = previousReadStates.get(message.id);
+					if (!previous) return message;
+					return {
+						...message,
+						read: previous.read,
+						...(message.threadMessageIds ? { threadUnread: previous.threadUnread } : {}),
+					};
+				}));
+				setSelectedMessages((current) => current.map((message) => {
+					const previous = previousSelectedRead.get(message.id);
+					return previous === undefined ? message : { ...message, read: previous };
+				}));
 				if (inboxUnreadDelta) dispatchMessageCountsDelta({ inboxUnreadDelta: -inboxUnreadDelta });
 			}
 			throw error;
